@@ -1,153 +1,123 @@
 import glob
 import os
-from collections.abc import Callable
-from typing import Optional
+from typing import Optional, Callable
 
 import kornia.augmentation as K
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torchgeo
 from matplotlib.figure import Figure
 from PIL import Image
 from torch import Tensor
-from torchgeo.datamodules.geo import NonGeoDataModule
-from torchgeo.datamodules.utils import dataset_split
-from torchgeo.datasets.utils import percentile_normalization
-from torchgeo.transforms import AugmentationSequential
-from torchgeo.transforms.transforms import _ExtractPatches
+from torch.utils.data import Dataset, random_split
+from lightning import LightningDataModule
+from kornia.augmentation.container import AugmentationSequential
 
 
-class WHUCD(torch.utils.data.Dataset):
+class WHUCD(Dataset):
     splits = ["train", "test"]
 
-    def __init__(
-        self,
-        root: str = "data",
-        split: str = "train",
-        transforms: Callable[[dict[str, Tensor]], dict[str, Tensor]] | None = None,
-    ) -> None:
+    def __init__(self, root: str = "data", split: str = "train", transforms: Optional[Callable] = None) -> None:
         assert split in self.splits
-
         self.root = root
         self.split = split
         self.transforms = transforms
-        self.files = self._load_files(self.root, self.split)
+        self.files = self._load_files()
 
-    def __getitem__(self, index: int) -> dict[str, Tensor]:
-        files = self.files[index]
-        image1 = self._load_image(files["image1"])
-        image2 = self._load_image(files["image2"])
-        mask = self._load_target(files["mask"])
-        sample = {"image1": image1, "image2": image2, "mask": mask}
+    def _load_files(self) -> list[dict[str, str]]:
+        image1_paths = sorted(glob.glob(os.path.join(self.root, "2012", self.split, "*.tif")))
+        image2_paths = sorted(glob.glob(os.path.join(self.root, "2016", self.split, "*.tif")))
+        mask_paths = sorted(glob.glob(os.path.join(self.root, "change_label", self.split, "*.tif")))
 
-        if self.transforms is not None:
-            sample = self.transforms(sample)
-
-        return sample
+        return [{"image1": a, "image2": b, "mask": m} for a, b, m in zip(image1_paths, image2_paths, mask_paths)]
 
     def __len__(self) -> int:
         return len(self.files)
 
+    def __getitem__(self, idx: int) -> dict[str, Tensor]:
+        paths = self.files[idx]
+        image1 = self._load_image(paths["image1"])
+        image2 = self._load_image(paths["image2"])
+        mask = self._load_mask(paths["mask"])
+        sample = {"image1": image1, "image2": image2, "mask": mask}
+        if self.transforms:
+            sample = self.transforms(sample)
+        return sample
+
     def _load_image(self, path: str) -> Tensor:
-        filename = os.path.join(path)
-        with Image.open(filename) as img:
-            array = np.array(img.convert("RGB"))
-            tensor = torch.from_numpy(array)
-            tensor = tensor.float()
-            tensor = tensor.permute((2, 0, 1))
-            return tensor
+        img = Image.open(path).convert("RGB")
+        array = np.array(img).astype(np.float32) / 255.0
+        return torch.tensor(array).permute(2, 0, 1)
 
-    def _load_target(self, path: str) -> Tensor:
-        filename = os.path.join(path)
-        with Image.open(filename) as img:
-            array = np.array(img.convert("L"))
-            tensor = torch.from_numpy(array)
-            tensor = torch.clamp(tensor, min=0, max=1)
-            tensor = tensor.to(torch.long)
-            return tensor
+    def _load_mask(self, path: str) -> Tensor:
+        img = Image.open(path).convert("L")
+        array = np.array(img)
+        binary_mask = (array > 0).astype(np.int64)
+        return torch.tensor(binary_mask)
 
-    def plot(self, sample: dict[str, Tensor], show_titles: bool = True, suptitle: str | None = None) -> Figure:
-        ncols = 3
+    def plot(self, sample: dict[str, Tensor], show_titles=True, suptitle=None) -> Figure:
+        ncols = 3 + int("prediction" in sample)
+        fig, axs = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
 
-        image1 = sample["image1"].permute(1, 2, 0).numpy()
-        image1 = percentile_normalization(image1, lower=0, upper=98, axis=(0, 1))
-
-        image2 = sample["image2"].permute(1, 2, 0).numpy()
-        image2 = percentile_normalization(image2, lower=0, upper=98, axis=(0, 1))
+        axs[0].imshow(sample["image1"].permute(1, 2, 0).numpy())
+        axs[1].imshow(sample["image2"].permute(1, 2, 0).numpy())
+        axs[2].imshow(sample["mask"].numpy(), cmap="gray")
 
         if "prediction" in sample:
-            ncols += 1
-
-        fig, axs = plt.subplots(nrows=1, ncols=ncols, figsize=(10, ncols * 5))
-
-        axs[0].imshow(image1)
-        axs[0].axis("off")
-        axs[1].imshow(image2)
-        axs[1].axis("off")
-        axs[2].imshow(sample["mask"], cmap="gray", interpolation="none")
-        axs[2].axis("off")
-
-        if "prediction" in sample:
-            axs[3].imshow(sample["prediction"], cmap="gray", interpolation="none")
-            axs[3].axis("off")
+            axs[3].imshow(sample["prediction"].numpy(), cmap="gray")
             if show_titles:
                 axs[3].set_title("Prediction")
 
-        if show_titles:
-            axs[0].set_title("Image 1")
-            axs[1].set_title("Image 2")
-            axs[2].set_title("Mask")
+        for i, key in enumerate(["Image 1", "Image 2", "Mask"] + (["Prediction"] if "prediction" in sample else [])):
+            axs[i].axis("off")
+            if show_titles:
+                axs[i].set_title(key)
 
-        if suptitle is not None:
-            plt.suptitle(suptitle)
+        if suptitle:
+            fig.suptitle(suptitle)
 
         return fig
 
-    def _load_files(self, root: str, split: str) -> list[dict[str, str]]:
-        images1 = sorted(glob.glob(os.path.join(root, "2012", split, "*.tif")))
-        images2 = sorted(glob.glob(os.path.join(root, "2016", split, "*.tif")))
-        masks = sorted(glob.glob(os.path.join(root, "change_label", split, "*.tif")))
 
-        files = []
-        for image1, image2, mask in zip(images1, images2, masks, strict=False):
-            files.append(dict(image1=image1, image2=image2, mask=mask))
-        return files
+class WHUCDDataModule(LightningDataModule):
+    def __init__(self, root: str = "data", batch_size: int = 8, patch_size: int = 256, num_workers: int = 2):
+        super().__init__()
+        self.root = root
+        self.batch_size = batch_size
+        self.patch_size = patch_size
+        self.num_workers = num_workers
 
+    def setup(self, stage: Optional[str] = None):
+        full_dataset = WHUCD(root=self.root, split="train", transforms=self.train_transform())
+        val_size = int(0.1 * len(full_dataset))
+        train_size = len(full_dataset) - val_size
+        self.train_dataset, self.val_dataset = random_split(full_dataset, [train_size, val_size])
+        self.test_dataset = WHUCD(root=self.root, split="test", transforms=self.test_transform())
 
-class WHUCDDataModule(NonGeoDataModule):
-    def __init__(self, patch_size: int = 256, val_split_pct: float = 0.1, *args, **kwargs):
-        super().__init__(WHUCD, *args, **kwargs)
-
-        self.patch_size = (patch_size, patch_size)
-        self.val_split_pct = val_split_pct
-
-        self.train_aug = AugmentationSequential(
-            K.RandomHorizontalFlip(p=0.5),
-            K.RandomVerticalFlip(p=0.5),
-            K.RandomResizedCrop(size=self.patch_size, scale=(0.8, 1.0), ratio=(1, 1), p=1.0),
-            K.Normalize(mean=0.0, std=255.0),
-            K.Normalize(mean=0.5, std=0.5),
-            data_keys=["image1", "image2", "mask"],
-        )
-        self.val_aug = AugmentationSequential(
-            K.Normalize(mean=0.0, std=255.0),
-            K.Normalize(mean=0.5, std=0.5),
-            _ExtractPatches(window_size=self.patch_size),
-            data_keys=["image1", "image2", "mask"],
-            same_on_batch=True,
-        )
-        self.test_aug = AugmentationSequential(
-            K.Normalize(mean=0.0, std=255.0),
-            K.Normalize(mean=0.5, std=0.5),
-            _ExtractPatches(window_size=self.patch_size),
-            data_keys=["image1", "image2", "mask"],
-            same_on_batch=True,
+    def train_transform(self):
+        return AugmentationSequential(
+            K.RandomHorizontalFlip(),
+            K.RandomVerticalFlip(),
+            K.RandomResizedCrop(self.patch_size, scale=(0.8, 1.0), ratio=(1.0, 1.0)),
+            data_keys=["image1", "image2", "mask"]
         )
 
-    def setup(self, stage: str) -> None:
-        if stage in ["fit", "validate"]:
-            self.dataset = WHUCD(split="train", **self.kwargs)
-            self.train_dataset, self.val_dataset = dataset_split(self.dataset, val_pct=self.val_split_pct)
-        if stage == "test":
-            self.test_dataset = WHUCD(split="test", **self.kwargs)
+    def test_transform(self):
+        return AugmentationSequential(
+            data_keys=["image1", "image2", "mask"]
+        )
+
+    def train_dataloader(self):
+        return torch.utils.data.DataLoader(
+            self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers
+        )
+
+    def val_dataloader(self):
+        return torch.utils.data.DataLoader(
+            self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers
+        )
+
+    def test_dataloader(self):
+        return torch.utils.data.DataLoader(
+            self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers
+        )
